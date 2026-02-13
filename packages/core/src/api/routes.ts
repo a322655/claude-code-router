@@ -194,6 +194,80 @@ async function handleFallback(
 }
 
 /**
+ * Sanitize empty thinking signatures from request body.
+ * Removes thinking blocks with empty signatures to prevent API errors.
+ */
+const sanitizeEmptyThinkingSignatures = (
+  body: unknown,
+  req?: FastifyRequest,
+) => {
+  if (!body || typeof body !== "object") {
+    return body;
+  }
+
+  const requestBody = body as Record<string, unknown>;
+  if (!Array.isArray(requestBody.messages)) {
+    return body;
+  }
+
+  let removedThinkingCount = 0;
+  const sanitizedMessages = requestBody.messages.flatMap((message) => {
+    if (!message || typeof message !== "object") {
+      return [message];
+    }
+
+    const currentMessage = message as Record<string, unknown>;
+    if (
+      currentMessage.role !== "assistant" ||
+      !Array.isArray(currentMessage.content)
+    ) {
+      return [message];
+    }
+
+    const filteredContent = currentMessage.content.filter((contentBlock) => {
+      if (!contentBlock || typeof contentBlock !== "object") {
+        return true;
+      }
+      const block = contentBlock as Record<string, unknown>;
+      if (block.type !== "thinking") {
+        return true;
+      }
+      if (typeof block.signature !== "string") {
+        return true;
+      }
+
+      const shouldKeep = block.signature.trim().length > 0;
+      if (!shouldKeep) {
+        removedThinkingCount += 1;
+      }
+      return shouldKeep;
+    });
+
+    if (filteredContent.length === currentMessage.content.length) {
+      return [message];
+    }
+    if (filteredContent.length === 0) {
+      return [];
+    }
+
+    return [{ ...currentMessage, content: filteredContent }];
+  });
+
+  if (!removedThinkingCount) {
+    return body;
+  }
+
+  req?.log.warn(
+    `Removed ${removedThinkingCount} thinking block(s) with empty signature before forwarding request`,
+  );
+
+  return {
+    ...requestBody,
+    messages: sanitizedMessages,
+  };
+};
+
+/**
  * Process request transformer chain
  * Sequentially execute transformRequestOut, provider transformers, model-specific transformers
  * Returns processed request body, config, and flag indicating whether to skip transformers
@@ -205,12 +279,12 @@ async function processRequestTransformers(
   headers: any,
   context: any
 ) {
-  let requestBody = body;
+  let requestBody = sanitizeEmptyThinkingSignatures(body, context?.req);
   let config: any = {};
   let bypass = false;
 
   // Check if transformers should be bypassed (passthrough mode)
-  bypass = shouldBypassTransformers(provider, transformer, body);
+  bypass = shouldBypassTransformers(provider, transformer, requestBody);
 
   if (bypass) {
     if (headers instanceof Headers) {

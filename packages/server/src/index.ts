@@ -19,6 +19,129 @@ import { pluginManager, tokenSpeedPlugin } from "@musistudio/llms";
 
 const event = new EventEmitter()
 
+const DEFAULT_USAGE = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+};
+
+type SSEEventData = {
+  message?: Record<string, unknown>;
+  usage?: unknown;
+  [key: string]: unknown;
+};
+
+type SSEEvent = {
+  event?: string;
+  data?: SSEEventData;
+  [key: string]: unknown;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function ensureUsageShape(usage: unknown): Record<string, unknown> {
+  const safeUsage: Record<string, unknown> = { ...DEFAULT_USAGE };
+  if (!isRecord(usage)) {
+    return safeUsage;
+  }
+  for (const [key, value] of Object.entries(usage)) {
+    if (value !== undefined && value !== null) {
+      safeUsage[key] = value;
+    }
+  }
+  return safeUsage;
+}
+
+function ensureCacheUsage(usage: unknown) {
+  if (!isRecord(usage)) {
+    return {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    };
+  }
+  return {
+    input_tokens:
+      typeof usage.input_tokens === "number" ? usage.input_tokens : 0,
+    output_tokens:
+      typeof usage.output_tokens === "number" ? usage.output_tokens : 0,
+    cache_creation_input_tokens:
+      typeof usage.cache_creation_input_tokens === "number"
+        ? usage.cache_creation_input_tokens
+        : 0,
+    cache_read_input_tokens:
+      typeof usage.cache_read_input_tokens === "number"
+        ? usage.cache_read_input_tokens
+        : 0,
+  };
+}
+
+function ensureStreamUsage(
+  stream: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  const decodeStream = new TransformStream<Uint8Array, string>({
+    transform(chunk, controller) {
+      controller.enqueue(decoder.decode(chunk, { stream: true }));
+    },
+    flush(controller) {
+      const tail = decoder.decode();
+      if (tail) {
+        controller.enqueue(tail);
+      }
+    },
+  });
+
+  const encodeStream = new TransformStream<string, Uint8Array>({
+    transform(text, controller) {
+      controller.enqueue(encoder.encode(text));
+    },
+  });
+
+  return stream
+    .pipeThrough(decodeStream)
+    .pipeThrough(new SSEParserTransform())
+    .pipeThrough(
+      new TransformStream<SSEEvent, SSEEvent>({
+        transform(event, controller) {
+          if (
+            event.event === "message_start" &&
+            isRecord(event.data?.message)
+          ) {
+            const message = event.data.message;
+            event = {
+              ...event,
+              data: {
+                ...event.data,
+                message: {
+                  ...message,
+                  usage: ensureUsageShape(message.usage),
+                },
+              },
+            };
+          } else if (event.event === "message_delta" && event.data) {
+            event = {
+              ...event,
+              data: {
+                ...event.data,
+                usage: ensureUsageShape(event.data.usage),
+              },
+            };
+          }
+          controller.enqueue(event);
+        },
+      }),
+    )
+    .pipeThrough(new SSESerializerTransform())
+    .pipeThrough(encodeStream);
+}
+
 async function initializeClaudeConfig() {
   const homeDir = homedir();
   const configPath = join(homeDir, ".claude.json");
@@ -41,7 +164,7 @@ async function initializeClaudeConfig() {
 
 interface RunOptions {
   port?: number;
-  logger?: any;
+  logger?: unknown;
 }
 
 /**
@@ -374,7 +497,8 @@ async function getServer(options: RunOptions = {}) {
           }).pipeThrough(new SSESerializerTransform()))
         }
 
-        const [originalStream, clonedStream] = payload.tee();
+        const safePayload = ensureStreamUsage(payload);
+        const [originalStream, clonedStream] = safePayload.tee();
         const read = async (stream: ReadableStream) => {
           const reader = stream.getReader();
           try {
@@ -389,7 +513,7 @@ async function getServer(options: RunOptions = {}) {
               const str = dataStr.slice(27);
               try {
                 const message = JSON.parse(str);
-                sessionUsageCache.put(req.sessionId, message.usage);
+                sessionUsageCache.put(req.sessionId, ensureCacheUsage(message.usage));
               } catch {}
             }
           } catch (readError: any) {
@@ -405,7 +529,7 @@ async function getServer(options: RunOptions = {}) {
         read(clonedStream);
         return done(null, originalStream)
       }
-      sessionUsageCache.put(req.sessionId, payload.usage);
+      sessionUsageCache.put(req.sessionId, ensureCacheUsage(payload.usage));
       if (typeof payload ==='object') {
         if (payload.error) {
           return done(payload.error, null)
