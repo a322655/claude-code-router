@@ -4,245 +4,127 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Claude Code Router is a tool that routes Claude Code requests to different LLM providers. It uses a Monorepo architecture with four main packages:
+Claude Code Router (CCR) routes Claude Code requests to different LLM providers. Monorepo with five packages:
 
-- **cli** (`@musistudio/claude-code-router`): Command-line tool providing the `ccr` command
-- **server** (`@CCR/server`): Core server handling API routing and transformations
-- **shared** (`@CCR/shared`): Shared constants, utilities, and preset management
+- **core** (`@musistudio/llms`): Core server framework — transformers, API routing, stream processing
+- **server** (`@CCR/server`): Business logic — scenario routing, token counting, agents, config management
+- **shared** (`@CCR/shared`): Constants, utilities, preset system
+- **cli** (`@CCR/cli`): Command-line tool providing the `ccr` command
 - **ui** (`@CCR/ui`): Web management interface (React + Vite)
 
-## Build Commands
+Dependency graph: `cli → server → core → shared` (ui is standalone).
 
-### Build all packages
+## Build & Install
+
+### Build all packages (must follow order: shared → core → server → cli → ui)
+
 ```bash
 pnpm build
 ```
 
-### Build individual packages
+### Install globally for testing
+
+**IMPORTANT**: `bun install -g` has tgz caching issues — the installed binary may not update. Use direct copy instead:
+
 ```bash
-pnpm build:cli      # Build CLI
-pnpm build:server   # Build Server
-pnpm build:ui       # Build UI
+pnpm build && cp packages/cli/dist/cli.js ~/.local/share/bun/install/global/node_modules/@CCR/cli/dist/cli.js && ccr restart
 ```
 
 ### Development mode
+
 ```bash
-pnpm dev:cli        # Develop CLI (ts-node)
-pnpm dev:server     # Develop Server (ts-node)
-pnpm dev:ui         # Develop UI (Vite)
+pnpm dev:cli        # CLI (ts-node)
+pnpm dev:server     # Server (ts-node)
+pnpm dev:ui         # UI (Vite dev server)
+pnpm dev:core       # Core (nodemon)
 ```
 
 ### Publish
+
 ```bash
 pnpm release        # Build and publish all packages
 ```
 
 ## Core Architecture
 
-### 1. Routing System (packages/server/src/utils/router.ts)
+### 1. Routing System (`packages/server/src/utils/router.ts`)
 
-The routing logic determines which model a request should be sent to:
+Scenario routing priority (checked in this order, first match wins):
 
-- **Default routing**: Uses `Router.default` configuration
-- **Project-level routing**: Checks `~/.claude/projects/<project-id>/claude-code-router.json`
-- **Custom routing**: Loads custom JavaScript router function via `CUSTOM_ROUTER_PATH`
-- **Built-in scenario routing**:
-  - `background`: Background tasks (typically lightweight models)
-  - `think`: Thinking-intensive tasks (Plan Mode)
-  - `longContext`: Long context (exceeds `longContextThreshold` tokens)
-  - `webSearch`: Web search tasks
-  - `image`: Image-related tasks
+1. **Subagent tag** — `<CCR-SUBAGENT-MODEL>` in system entries only (highest priority)
+2. **webSearch** — request tools contain `web_search_*` type
+3. **longContext** — token count exceeds `longContextThreshold` (default 60000)
+4. **background** — model name contains “claude” + “haiku”
+5. **think** — `req.body.thinking` is present
+6. **Explicit `provider,model`** — comma-separated model string
+7. **Default** — `Router.default`
 
-Token calculation uses `tiktoken` (cl100k_base) to estimate request size.
+**Critical ordering**: webSearch MUST be checked before background, because Claude Code sends web search requests using Haiku models.
 
-### 2. Transformer System
+Project-level routing: `~/.claude-code-router/<project-folder>/config.json` overrides global Router.
 
-The project uses the `@musistudio/llms` package (external dependency) to handle request/response transformations. Transformers adapt to different provider API differences:
+### 2. Bypass Mode (`packages/core/src/api/routes.ts`)
 
-- Built-in transformers: `anthropic`, `deepseek`, `gemini`, `openrouter`, `groq`, `maxtoken`, `tooluse`, `reasoning`, `enhancetool`, etc.
-- Custom transformers: Load external plugins via `transformers` array in `config.json`
+When a provider has exactly one transformer matching the endpoint transformer, ALL transformers are skipped (bypass mode). The raw Anthropic request is forwarded directly. This means Anthropic-specific parameters (`thinking`, `context_management`, `web_search_20250305`, `tool_choice`) pass through unmodified.
 
-Transformer configuration supports:
-- Global application (provider level)
-- Model-specific application
-- Option passing (e.g., `max_tokens` parameter for `maxtoken`)
+**Implication**: Non-Anthropic providers using `/v1/messages` endpoint + Anthropic transformer trigger bypass. Use an intermediate proxy (e.g., CPA) for protocol translation when routing to non-Anthropic providers.
 
-### 3. Agent System (packages/server/src/agents/)
+### 3. Transformer System (`packages/core/`)
 
-Agents are pluggable feature modules that can:
-- Detect whether to handle a request (`shouldHandle`)
-- Modify requests (`reqHandler`)
-- Provide custom tools (`tools`)
+Transformers handle request/response format conversion between Claude API and provider-specific APIs. `@musistudio/llms` is a **local workspace package** (NOT an external dependency), type definitions in `packages/server/src/types.d.ts`.
 
-Built-in agents:
-- **imageAgent**: Handles image-related tasks
+Built-in transformers: `anthropic`, `deepseek`, `gemini`, `openrouter`, `groq`, `maxtoken`, `tooluse`, `reasoning`, `enhancetool`, etc. Custom transformers loaded via `transformers` array in config.
 
-Agent tool call flow:
-1. Detect and mark agents in `preHandler` hook
-2. Add agent tools to the request
-3. Intercept tool call events in `onSend` hook
-4. Execute agent tool and initiate new LLM request
-5. Stream results back
+### 4. Agent System (`packages/server/src/agents/`)
 
-### 4. SSE Stream Processing
+Pluggable modules: `shouldHandle` → `reqHandler` → inject tools → intercept tool calls in `onSend` → execute → stream results. Built-in: `imageAgent`.
 
-The server uses custom Transform streams to handle Server-Sent Events:
-- `SSEParserTransform`: Parses SSE text stream into event objects
-- `SSESerializerTransform`: Serializes event objects into SSE text stream
-- `rewriteStream`: Intercepts and modifies stream data (for agent tool calls)
+### 5. SSE Stream Processing
 
-### 5. Configuration Management
+- `SSEParserTransform`: SSE text → event objects
+- `SSESerializerTransform`: event objects → SSE text
+- `rewriteStream`: intercepts stream for agent tool call handling
 
-Configuration file location: `~/.claude-code-router/config.json`
+### 6. Configuration
 
-Key features:
-- Supports environment variable interpolation (`$VAR_NAME` or `${VAR_NAME}`)
-- JSON5 format (supports comments)
-- Automatic backups (keeps last 3 backups)
-- Hot reload requires service restart (`ccr restart`)
+Location: `~/.claude-code-router/config.json` (JSON5, supports comments and env var interpolation `$VAR`/`${VAR}`). Automatic backups (last 3). Changes require `ccr restart`.
 
-Configuration validation:
-- If `Providers` are configured, both `HOST` and `APIKEY` must be set
-- Otherwise listens on `0.0.0.0` without authentication
+### 7. Logging
 
-### 6. Logging System
-
-Two separate logging systems:
-
-**Server-level logs** (pino):
-- Location: `~/.claude-code-router/logs/ccr-*.log`
-- Content: HTTP requests, API calls, server events
-- Configuration: `LOG_LEVEL` (fatal/error/warn/info/debug/trace)
-
-**Application-level logs**:
-- Location: `~/.claude-code-router/claude-code-router.log`
-- Content: Routing decisions, business logic events
+- **Server logs** (pino): `~/.claude-code-router/logs/ccr-*.log` — HTTP requests, routing decisions. Lines can be tens of KB; use Python scripts (not cat/tail) for parsing.
+- **Application logs**: `~/.claude-code-router/claude-code-router.log`
+- Log level: `LOG_LEVEL` config (fatal/error/warn/info/debug/trace)
 
 ## CLI Commands
 
 ```bash
-ccr start      # Start server
-ccr stop       # Stop server
-ccr restart    # Restart server
-ccr status     # Show status
-ccr code       # Execute claude command
-ccr model      # Interactive model selection and configuration
-ccr preset     # Manage presets (export, install, list, info, delete)
-ccr activate   # Output shell environment variables (for integration)
-ccr ui         # Open Web UI
-ccr statusline # Integrated statusline (reads JSON from stdin)
-```
-
-### Preset Commands
-
-```bash
-ccr preset export <name>      # Export current configuration as a preset
-ccr preset install <source>   # Install a preset from file, URL, or name
-ccr preset list               # List all installed presets
-ccr preset info <name>        # Show preset information
-ccr preset delete <name>      # Delete a preset
+ccr start | stop | restart | status    # Service management
+ccr code                                # Execute claude command
+ccr model                               # Interactive model selection
+ccr preset export|install|list|info|delete  # Preset management
+ccr activate                            # Output shell env vars
+ccr ui                                  # Open Web UI
+ccr statusline                          # Statusline (reads JSON from stdin)
 ```
 
 ## Subagent Routing
 
-Use special tags in subagent prompts to specify models:
 ```
 <CCR-SUBAGENT-MODEL>provider,model</CCR-SUBAGENT-MODEL>
-Please help me analyze this code...
 ```
 
-## Preset System
-
-The preset system allows users to save, share, and reuse configurations easily.
-
-### Preset Structure
-
-Presets are stored in `~/.claude-code-router/presets/<preset-name>/manifest.json`
-
-Each preset contains:
-- **Metadata**: name, version, description, author, keywords, etc.
-- **Configuration**: Providers, Router, transformers, and other settings
-- **Dynamic Schema** (optional): Input fields for collecting required information during installation
-- **Required Inputs** (optional): Fields that need to be filled during installation (e.g., API keys)
-
-### Core Functions
-
-Located in `packages/shared/src/preset/`:
-
-- **export.ts**: Export current configuration as a preset directory
-  - `exportPreset(presetName, config, options)`: Creates preset directory with manifest.json
-  - Automatically sanitizes sensitive data (api_key fields become `{{field}}` placeholders)
-
-- **install.ts**: Install and manage presets
-  - `installPreset(preset, config, options)`: Install preset to config
-  - `loadPreset(source)`: Load preset from directory
-  - `listPresets()`: List all installed presets
-  - `isPresetInstalled(presetName)`: Check if preset is installed
-  - `validatePreset(preset)`: Validate preset structure
-
-- **merge.ts**: Merge preset configuration with existing config
-  - Handles conflicts using different strategies (ask, overwrite, merge, skip)
-
-- **sensitiveFields.ts**: Identify and sanitize sensitive fields
-  - Detects api_key, password, secret fields automatically
-  - Replaces sensitive values with environment variable placeholders
-
-### Preset File Format
-
-**manifest.json** (in preset directory):
-```json
-{
-  "name": "my-preset",
-  "version": "1.0.0",
-  "description": "My configuration",
-  "author": "Author Name",
-  "keywords": ["openai", "production"],
-  "Providers": [...],
-  "Router": {...},
-  "schema": [
-    {
-      "id": "apiKey",
-      "type": "password",
-      "label": "OpenAI API Key",
-      "prompt": "Enter your OpenAI API key"
-    }
-  ]
-}
-```
-
-### CLI Integration
-
-The CLI layer (`packages/cli/src/utils/preset/`) handles:
-- User interaction and prompts
-- File operations
-- Display formatting
-
-Key files:
-- `commands.ts`: Command handlers for `ccr preset` subcommands
-- `export.ts`: CLI wrapper for export functionality
-- `install.ts`: CLI wrapper for install functionality
-
-## Dependencies
-
-```
-cli → server → shared
-server → @musistudio/llms (core routing and transformation logic)
-ui (standalone frontend application)
-```
+Only scanned in system entries to prevent routing leaks from user messages.
 
 ## Development Notes
 
-1. **Node.js version**: Requires >= 18.0.0
-2. **Package manager**: Uses pnpm (monorepo depends on workspace protocol)
-3. **TypeScript**: All packages use TypeScript, but UI package is ESM module
-4. **Build tools**:
-   - cli/server/shared: esbuild
-   - ui: Vite + TypeScript
-5. **@musistudio/llms**: This is an external dependency package providing the core server framework and transformer functionality, type definitions in `packages/server/src/types.d.ts`
-6. **Code comments**: All comments in code MUST be written in English
-7. **Documentation**: When implementing new features, add documentation to the docs project instead of creating standalone md files
+1. **Node.js**: Requires >= 20.0.0
+2. **Package manager**: pnpm (workspace protocol)
+3. **Build tools**: esbuild (core/server/shared/cli), Vite (ui). Core builds both CJS and ESM.
+4. **No test suite**: Project has no test files or test framework configured.
+5. **Code comments**: MUST be written in English.
+6. **Documentation**: Add to the docs project, not standalone md files.
 
-## Configuration Example Locations
+## Configuration Example
 
-- Main configuration example: Complete example in README.md
-- Custom router example: `custom-router.example.js`
+- Main config example: README.md
+- Custom router: `custom-router.example.js`
