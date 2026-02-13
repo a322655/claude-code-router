@@ -67,6 +67,7 @@ export interface TokenizeRequest {
     content: string | Array<{
       type: string;
       text?: string;
+      thinking?: string;
       input?: any;
       content?: string | any;
     }>;

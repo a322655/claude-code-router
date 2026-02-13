@@ -44,6 +44,11 @@ export class TiktokenTokenizer implements ITokenizer {
           message.content.forEach((contentPart: any) => {
             if (contentPart.type === "text") {
               tokenCount += encoding.encode(contentPart.text).length;
+            } else if (
+              contentPart.type === "thinking" &&
+              typeof contentPart.thinking === "string"
+            ) {
+              tokenCount += encoding.encode(contentPart.thinking).length;
             } else if (contentPart.type === "tool_use") {
               tokenCount += encoding.encode(
                 JSON.stringify(contentPart.input)

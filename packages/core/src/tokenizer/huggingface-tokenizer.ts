@@ -194,6 +194,11 @@ export class HuggingFaceTokenizer implements ITokenizer {
           for (const contentPart of message.content) {
             if (contentPart.type === "text" && contentPart.text) {
               parts.push(contentPart.text);
+            } else if (
+              contentPart.type === "thinking" &&
+              typeof contentPart.thinking === "string"
+            ) {
+              parts.push(contentPart.thinking);
             } else if (contentPart.type === "tool_use" && contentPart.input) {
               parts.push(JSON.stringify(contentPart.input));
             } else if (contentPart.type === "tool_result") {

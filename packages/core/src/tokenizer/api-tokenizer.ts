@@ -179,6 +179,11 @@ export class ApiTokenizer implements ITokenizer {
         .map((part: any) => {
           if (part.type === "text" && part.text) {
             return part.text;
+          } else if (
+            part.type === "thinking" &&
+            typeof part.thinking === "string"
+          ) {
+            return part.thinking;
           } else if (part.type === "tool_use" && part.input) {
             return JSON.stringify(part.input);
           } else if (part.type === "tool_result") {
