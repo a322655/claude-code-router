@@ -48,6 +48,11 @@ export const calculateTokenCount = (
         message.content.forEach((contentPart: any) => {
           if (contentPart.type === "text") {
             tokenCount += enc.encode(contentPart.text).length;
+          } else if (
+            contentPart.type === "thinking" &&
+            typeof contentPart.thinking === "string"
+          ) {
+            tokenCount += enc.encode(contentPart.thinking).length;
           } else if (contentPart.type === "tool_use") {
             tokenCount += enc.encode(JSON.stringify(contentPart.input)).length;
           } else if (contentPart.type === "tool_result") {
@@ -106,19 +111,69 @@ const getProjectSpecificRouter = async (
       // First try to read sessionConfig file
       try {
         const sessionConfig = JSON.parse(await readFile(sessionConfigPath, "utf8"));
-        if (sessionConfig && sessionConfig.Router) {
+        if (sessionConfig?.Router) {
           return sessionConfig.Router;
         }
       } catch {}
       try {
         const projectConfig = JSON.parse(await readFile(projectConfigPath, "utf8"));
-        if (projectConfig && projectConfig.Router) {
+        if (projectConfig?.Router) {
           return projectConfig.Router;
         }
       } catch {}
     }
   }
   return undefined; // Return undefined to use original configuration
+};
+
+const extractMessageText = (
+  content: string | ContentBlockParam[] | undefined
+) => {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part?.type === "text" && typeof part?.text === "string")
+    .map((part) => part.text)
+    .join("\n");
+};
+
+const hasTeamLeadTeammatePayload = (messages: MessageParam[] | undefined) => {
+  if (!Array.isArray(messages)) return false;
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    const text = extractMessageText(message.content);
+    if (text.includes('<teammate-message teammate_id="team-lead"')) {
+      return true;
+    }
+  }
+  return false;
+};
+
+interface ProviderConfig {
+  name?: string;
+  models?: string[];
+}
+
+const isKnownProviderModel = (
+  providers: ProviderConfig[],
+  providerModel: string
+) => {
+  const [providerName, ...modelParts] = providerModel.split(",");
+  if (!providerName || modelParts.length === 0) return false;
+
+  const modelName = modelParts.join(",");
+  const provider = providers.find(
+    (item) =>
+      typeof item?.name === "string" &&
+      item.name.toLowerCase() === providerName.toLowerCase()
+  );
+  if (!provider || !Array.isArray(provider.models)) return false;
+
+  return provider.models.some(
+    (candidate) =>
+      typeof candidate === "string" &&
+      candidate.toLowerCase() === modelName.toLowerCase()
+  );
 };
 
 const getUseModel = async (
@@ -128,11 +183,100 @@ const getUseModel = async (
   lastUsage?: Usage | undefined
 ): Promise<{ model: string; scenarioType: RouterScenarioType }> => {
   const projectSpecificRouter = await getProjectSpecificRouter(req, configService);
-  const providers = configService.get<any[]>("providers") || [];
+  const providers = configService.get<ProviderConfig[]>("providers") || [];
   const Router = projectSpecificRouter || configService.get("Router");
+  const hasTeamLeadPayload = hasTeamLeadTeammatePayload(req.body?.messages);
 
-  if (req.body.model.includes(",")) {
-    const [provider, model] = req.body.model.split(",");
+  // Subagent model routing — HIGHEST priority, checked before comma-in-model.
+  // Only scan system entries (NOT messages) to prevent routing leaks.
+  for (const entry of req.body?.system ?? []) {
+    if (!entry?.text) continue;
+    if (!entry.text.includes("<CCR-SUBAGENT-MODEL>")) continue;
+
+    const match = entry.text.match(
+      /<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s
+    );
+    if (!match) continue;
+
+    entry.text = entry.text.replace(match[0], "");
+    const candidateModel = match[1].trim();
+
+    if (
+      !candidateModel ||
+      candidateModel.includes("`") ||
+      candidateModel.includes("\\")
+    ) {
+      req.log.warn("Ignoring malformed subagent model tag");
+      continue;
+    }
+
+    if (hasTeamLeadPayload) {
+      req.log.warn(
+        `Ignoring leaked subagent model tag due to team-lead payload: ${candidateModel}`
+      );
+      continue;
+    }
+
+    if (!isKnownProviderModel(providers, candidateModel)) {
+      req.log.warn(`Ignoring unknown subagent model tag: ${candidateModel}`);
+      continue;
+    }
+
+    req.log.info(`Using subagent model: ${candidateModel}`);
+    return { model: candidateModel, scenarioType: 'default' };
+  }
+
+  const rawModel = req.body.model;
+  const globalRouter = configService.get("Router");
+
+  // Capability-based routing takes priority over model-based routing.
+  // webSearch must be checked before background, because Claude Code
+  // sends web search requests using Haiku models.
+  if (
+    Array.isArray(req.body.tools) &&
+    req.body.tools.some((tool: any) => tool.type?.startsWith("web_search")) &&
+    Router?.webSearch
+  ) {
+    return { model: Router.webSearch, scenarioType: 'webSearch' };
+  }
+
+  const longContextThreshold = Router?.longContextThreshold || 60000;
+  const lastUsagePromptTokens =
+    (lastUsage?.input_tokens || 0) +
+    (lastUsage?.cache_creation_input_tokens || 0) +
+    (lastUsage?.cache_read_input_tokens || 0);
+  const lastUsageThreshold = lastUsagePromptTokens > longContextThreshold;
+  const tokenCountThreshold = tokenCount > longContextThreshold;
+  req.log.info(
+    `LongContext decision metrics: tokenCount=${tokenCount}, lastUsage.input=${lastUsage?.input_tokens || 0}, lastUsage.cacheCreation=${lastUsage?.cache_creation_input_tokens || 0}, lastUsage.cacheRead=${lastUsage?.cache_read_input_tokens || 0}, lastUsagePromptTokens=${lastUsagePromptTokens}, threshold=${longContextThreshold}`
+  );
+  if ((lastUsageThreshold || tokenCountThreshold) && Router?.longContext) {
+    req.log.info(
+      `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}`
+    );
+    return { model: Router.longContext, scenarioType: 'longContext' };
+  }
+
+  if (rawModel?.includes("claude") && rawModel?.includes("haiku")) {
+    const hasTools = Array.isArray(req.body.tools) && req.body.tools.length > 0;
+    if (!hasTools && globalRouter?.titleSummary) {
+      req.log.info(`Using titleSummary model for ${rawModel}`);
+      return { model: globalRouter.titleSummary, scenarioType: 'titleSummary' };
+    }
+    if (globalRouter?.background) {
+      req.log.info(`Using background model for ${rawModel}`);
+      return { model: globalRouter.background, scenarioType: 'background' };
+    }
+  }
+
+  if (req.body.thinking && Router?.think) {
+    req.log.info(`Using think model for ${req.body.thinking}`);
+    return { model: Router.think, scenarioType: 'think' };
+  }
+
+  // --- Explicit provider,model resolution ---
+  if (rawModel.includes(",")) {
+    const [provider, model] = rawModel.split(",");
     const finalProvider = providers.find(
       (p: any) => p.name.toLowerCase() === provider
     );
@@ -142,60 +286,9 @@ const getUseModel = async (
     if (finalProvider && finalModel) {
       return { model: `${finalProvider.name},${finalModel}`, scenarioType: 'default' };
     }
-    return { model: req.body.model, scenarioType: 'default' };
+    return { model: rawModel, scenarioType: 'default' };
   }
 
-  // if tokenCount is greater than the configured threshold, use the long context model
-  const longContextThreshold = Router?.longContextThreshold || 60000;
-  const lastUsageThreshold =
-    lastUsage &&
-    lastUsage.input_tokens > longContextThreshold &&
-    tokenCount > 20000;
-  const tokenCountThreshold = tokenCount > longContextThreshold;
-  if ((lastUsageThreshold || tokenCountThreshold) && Router?.longContext) {
-    req.log.info(
-      `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}`
-    );
-    return { model: Router.longContext, scenarioType: 'longContext' };
-  }
-  if (
-    req.body?.system?.length > 1 &&
-    req.body?.system[1]?.text?.startsWith("<CCR-SUBAGENT-MODEL>")
-  ) {
-    const model = req.body?.system[1].text.match(
-      /<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s
-    );
-    if (model) {
-      req.body.system[1].text = req.body.system[1].text.replace(
-        `<CCR-SUBAGENT-MODEL>${model[1]}</CCR-SUBAGENT-MODEL>`,
-        ""
-      );
-      return { model: model[1], scenarioType: 'default' };
-    }
-  }
-  // Use the background model for any Claude Haiku variant
-  const globalRouter = configService.get("Router");
-  if (
-    req.body.model?.includes("claude") &&
-    req.body.model?.includes("haiku") &&
-    globalRouter?.background
-  ) {
-    req.log.info(`Using background model for ${req.body.model}`);
-    return { model: globalRouter.background, scenarioType: 'background' };
-  }
-  // The priority of websearch must be higher than thinking.
-  if (
-    Array.isArray(req.body.tools) &&
-    req.body.tools.some((tool: any) => tool.type?.startsWith("web_search")) &&
-    Router?.webSearch
-  ) {
-    return { model: Router.webSearch, scenarioType: 'webSearch' };
-  }
-  // if exits thinking, use the think model
-  if (req.body.thinking && Router?.think) {
-    req.log.info(`Using think model for ${req.body.thinking}`);
-    return { model: Router.think, scenarioType: 'think' };
-  }
   return { model: Router?.default, scenarioType: 'default' };
 };
 
@@ -205,11 +298,12 @@ export interface RouterContext {
   event?: any;
 }
 
-export type RouterScenarioType = 'default' | 'background' | 'think' | 'longContext' | 'webSearch';
+export type RouterScenarioType = 'default' | 'background' | 'titleSummary' | 'think' | 'longContext' | 'webSearch';
 
 export interface RouterFallbackConfig {
   default?: string[];
   background?: string[];
+  titleSummary?: string[];
   think?: string[];
   longContext?: string[];
   webSearch?: string[];
@@ -236,6 +330,8 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
     system[1].text = `${prompt}<env>${system[1].text.split("<env>").pop()}`;
   }
 
+  // Token counting: isolated so failures don't affect model routing
+  let tokenCount = 0;
   try {
     // Try to get tokenizer config for the current model
     const [providerName, modelName] = req.body.model.split(",");
@@ -245,8 +341,6 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
     );
 
     // Use TokenizerService if available, otherwise fall back to legacy method
-    let tokenCount: number;
-
     if (context.tokenizerService) {
       const result = await context.tokenizerService.countTokens(
         {
@@ -265,7 +359,11 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
         tools as Tool[]
       );
     }
+  } catch (tokenError: any) {
+    req.log.warn(`Token counting failed (using 0): ${tokenError.message}`);
+  }
 
+  try {
     let model;
     const customRouterPath = configService.get("CUSTOM_ROUTER_PATH");
     if (customRouterPath) {
@@ -310,10 +408,7 @@ export const searchProjectBySession = async (
   // Check cache first
   if (sessionProjectCache.has(sessionId)) {
     const result = sessionProjectCache.get(sessionId);
-    if (!result || result === '') {
-      return null;
-    }
-    return result;
+    return result || null;
   }
 
   try {
