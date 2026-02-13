@@ -499,22 +499,39 @@ async function getServer(options: RunOptions = {}) {
 
         const safePayload = ensureStreamUsage(payload);
         const [originalStream, clonedStream] = safePayload.tee();
-        const read = async (stream: ReadableStream) => {
-          const reader = stream.getReader();
+        const read = async (stream: ReadableStream<Uint8Array>) => {
+          const decoder = new TextDecoder();
+          const decodeStream = new TransformStream<Uint8Array, string>({
+            transform(chunk, controller) {
+              controller.enqueue(decoder.decode(chunk, { stream: true }));
+            },
+            flush(controller) {
+              const tail = decoder.decode();
+              if (tail) {
+                controller.enqueue(tail);
+              }
+            },
+          });
+
+          const reader = stream
+            .pipeThrough(decodeStream)
+            .pipeThrough(new SSEParserTransform())
+            .getReader();
+
           try {
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              // Process the value if needed
-              const dataStr = new TextDecoder().decode(value);
-              if (!dataStr.startsWith("event: message_delta")) {
-                continue;
+
+              if (
+                value.event === "message_start" &&
+                isRecord(value.data?.message)
+              ) {
+                sessionUsageCache.put(
+                  req.sessionId,
+                  ensureCacheUsage(value.data.message.usage)
+                );
               }
-              const str = dataStr.slice(27);
-              try {
-                const message = JSON.parse(str);
-                sessionUsageCache.put(req.sessionId, ensureCacheUsage(message.usage));
-              } catch {}
             }
           } catch (readError: any) {
             if (readError.name === 'AbortError' || readError.code === 'ERR_STREAM_PREMATURE_CLOSE') {

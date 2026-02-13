@@ -29,10 +29,150 @@ interface MessageCreateParamsBase {
   messages?: MessageParam[];
   system?: string | any[];
   tools?: Tool[];
+  usage?: Usage;
   [key: string]: any;
 }
 
 const enc = get_encoding("cl100k_base");
+
+const MIN_TOKEN_COUNT_FOR_LAST_USAGE = 20000;
+const SESSION_USAGE_TAIL_BYTES = 256 * 1024;
+
+const usagePromptTokens = (usage?: Usage) =>
+  (usage?.input_tokens || 0) +
+  (usage?.cache_creation_input_tokens || 0) +
+  (usage?.cache_read_input_tokens || 0);
+
+const normalizeUsage = (usage: unknown): Usage => {
+  if (!usage || typeof usage !== "object") {
+    return {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    };
+  }
+
+  const record = usage as Record<string, unknown>;
+  return {
+    input_tokens:
+      typeof record.input_tokens === "number" ? record.input_tokens : 0,
+    output_tokens:
+      typeof record.output_tokens === "number" ? record.output_tokens : 0,
+    cache_read_input_tokens:
+      typeof record.cache_read_input_tokens === "number"
+        ? record.cache_read_input_tokens
+        : 0,
+    cache_creation_input_tokens:
+      typeof record.cache_creation_input_tokens === "number"
+        ? record.cache_creation_input_tokens
+        : 0,
+  };
+};
+
+const getUsageFromJsonlLine = (line: string): Usage | undefined => {
+  try {
+    const entry = JSON.parse(line);
+    if (entry?.isSidechain === true) return undefined;
+    if (entry?.type !== "assistant") return undefined;
+
+    const usage = normalizeUsage(entry?.message?.usage);
+    return usagePromptTokens(usage) > 0 ? usage : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const sessionTranscriptUsageCache = new LRUCache<
+  string,
+  { mtimeMs: number; usage: Usage }
+>({
+  max: 1000,
+});
+
+const getLastUsageFromSessionTranscript = async (
+  sessionId: string
+): Promise<Usage | undefined> => {
+  const project = await searchProjectBySession(sessionId);
+  if (!project) return undefined;
+
+  const sessionFilePath = join(CLAUDE_PROJECTS_DIR, project, `${sessionId}.jsonl`);
+
+  try {
+    const fileStats = await stat(sessionFilePath);
+    const cached = sessionTranscriptUsageCache.get(sessionId);
+    if (cached && cached.mtimeMs === fileStats.mtimeMs) {
+      return cached.usage;
+    }
+
+    const handle = await open(sessionFilePath, "r");
+    try {
+      const size = fileStats.size;
+      const start = Math.max(0, size - SESSION_USAGE_TAIL_BYTES);
+      const length = size - start;
+      if (length <= 0) return undefined;
+
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+
+      let text = buffer.toString("utf8");
+      if (start > 0) {
+        const firstNewline = text.indexOf("\n");
+        if (firstNewline >= 0) {
+          text = text.slice(firstNewline + 1);
+        }
+      }
+
+      const lines = text.split("\n");
+      for (let index = lines.length - 1; index >= 0; index--) {
+        const line = lines[index].trim();
+        if (!line) continue;
+        const usage = getUsageFromJsonlLine(line);
+        if (!usage) continue;
+
+        sessionTranscriptUsageCache.set(sessionId, {
+          mtimeMs: fileStats.mtimeMs,
+          usage,
+        });
+        return usage;
+      }
+
+      return undefined;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
+  }
+};
+
+const getEffectiveLastUsage = async (
+  req: any,
+  lastUsage?: Usage
+): Promise<{
+  usage?: Usage;
+  source: "cache" | "request" | "transcript" | "none";
+}> => {
+  if (usagePromptTokens(lastUsage) > 0) {
+    return { usage: lastUsage, source: "cache" };
+  }
+
+  const requestUsage = normalizeUsage(req?.body?.usage);
+  if (usagePromptTokens(requestUsage) > 0) {
+    return { usage: requestUsage, source: "request" };
+  }
+
+  if (!req?.sessionId) {
+    return { usage: lastUsage, source: "none" };
+  }
+
+  const transcriptUsage = await getLastUsageFromSessionTranscript(req.sessionId);
+  if (usagePromptTokens(transcriptUsage) > 0) {
+    return { usage: transcriptUsage, source: "transcript" };
+  }
+
+  return { usage: lastUsage, source: "none" };
+};
 
 export const calculateTokenCount = (
   messages: MessageParam[],
@@ -241,18 +381,19 @@ const getUseModel = async (
   }
 
   const longContextThreshold = Router?.longContextThreshold || 60000;
-  const lastUsagePromptTokens =
-    (lastUsage?.input_tokens || 0) +
-    (lastUsage?.cache_creation_input_tokens || 0) +
-    (lastUsage?.cache_read_input_tokens || 0);
-  const lastUsageThreshold = lastUsagePromptTokens > longContextThreshold;
+  const { usage: effectiveLastUsage, source: usageSource } =
+    await getEffectiveLastUsage(req, lastUsage);
+  const effectiveLastUsagePromptTokens = usagePromptTokens(effectiveLastUsage);
+  const lastUsageThreshold =
+    effectiveLastUsagePromptTokens > longContextThreshold &&
+    tokenCount > MIN_TOKEN_COUNT_FOR_LAST_USAGE;
   const tokenCountThreshold = tokenCount > longContextThreshold;
   req.log.info(
-    `LongContext decision metrics: tokenCount=${tokenCount}, lastUsage.input=${lastUsage?.input_tokens || 0}, lastUsage.cacheCreation=${lastUsage?.cache_creation_input_tokens || 0}, lastUsage.cacheRead=${lastUsage?.cache_read_input_tokens || 0}, lastUsagePromptTokens=${lastUsagePromptTokens}, threshold=${longContextThreshold}`
+    `LongContext decision metrics: tokenCount=${tokenCount}, usageSource=${usageSource}, lastUsage.input=${effectiveLastUsage?.input_tokens || 0}, lastUsage.cacheCreation=${effectiveLastUsage?.cache_creation_input_tokens || 0}, lastUsage.cacheRead=${effectiveLastUsage?.cache_read_input_tokens || 0}, lastUsagePromptTokens=${effectiveLastUsagePromptTokens}, minTokenCountForLastUsage=${MIN_TOKEN_COUNT_FOR_LAST_USAGE}, threshold=${longContextThreshold}`
   );
   if ((lastUsageThreshold || tokenCountThreshold) && Router?.longContext) {
     req.log.info(
-      `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}`
+      `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}, usageSource=${usageSource}`
     );
     return { model: Router.longContext, scenarioType: 'longContext' };
   }
