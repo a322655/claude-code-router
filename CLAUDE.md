@@ -124,6 +124,20 @@ Only scanned in system entries to prevent routing leaks from user messages.
 5. **Code comments**: MUST be written in English.
 6. **Documentation**: Add to the docs project, not standalone md files.
 
+## Log Verification Scripts (`.claude/scripts`)
+
+- `verify_trace_markers.py`: Validate TRACE marker routing results in CCR logs (subagent routing correctness, no tag leak to lead, no provider errors in TRACE requests)
+- `check_log_error.py`: Count specific error messages in CCR logs and print related reqIds
+
+Examples:
+
+```bash
+uv run .claude/scripts/verify_trace_markers.py --prefix TRACE_TEST_20260214_A1_
+uv run .claude/scripts/check_log_error.py --needle "cache_control cannot be set for empty text blocks"
+```
+
+Both scripts default to the latest `~/.claude-code-router/logs/ccr-*.log`, and can also target a specific file via `--log`.
+
 ## Configuration Example
 
 - Main config example: README.md

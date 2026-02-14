@@ -1,5 +1,4 @@
 import { get_encoding } from "tiktoken";
-import { sessionUsageCache, Usage } from "./cache";
 import { readFile } from "fs/promises";
 import { opendir, stat } from "fs/promises";
 import { join } from "path";
@@ -29,150 +28,11 @@ interface MessageCreateParamsBase {
   messages?: MessageParam[];
   system?: string | any[];
   tools?: Tool[];
-  usage?: Usage;
   [key: string]: any;
 }
 
 const enc = get_encoding("cl100k_base");
 
-const MIN_TOKEN_COUNT_FOR_LAST_USAGE = 20000;
-const SESSION_USAGE_TAIL_BYTES = 256 * 1024;
-
-const usagePromptTokens = (usage?: Usage) =>
-  (usage?.input_tokens || 0) +
-  (usage?.cache_creation_input_tokens || 0) +
-  (usage?.cache_read_input_tokens || 0);
-
-const normalizeUsage = (usage: unknown): Usage => {
-  if (!usage || typeof usage !== "object") {
-    return {
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_read_input_tokens: 0,
-      cache_creation_input_tokens: 0,
-    };
-  }
-
-  const record = usage as Record<string, unknown>;
-  return {
-    input_tokens:
-      typeof record.input_tokens === "number" ? record.input_tokens : 0,
-    output_tokens:
-      typeof record.output_tokens === "number" ? record.output_tokens : 0,
-    cache_read_input_tokens:
-      typeof record.cache_read_input_tokens === "number"
-        ? record.cache_read_input_tokens
-        : 0,
-    cache_creation_input_tokens:
-      typeof record.cache_creation_input_tokens === "number"
-        ? record.cache_creation_input_tokens
-        : 0,
-  };
-};
-
-const getUsageFromJsonlLine = (line: string): Usage | undefined => {
-  try {
-    const entry = JSON.parse(line);
-    if (entry?.isSidechain === true) return undefined;
-    if (entry?.type !== "assistant") return undefined;
-
-    const usage = normalizeUsage(entry?.message?.usage);
-    return usagePromptTokens(usage) > 0 ? usage : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-const sessionTranscriptUsageCache = new LRUCache<
-  string,
-  { mtimeMs: number; usage: Usage }
->({
-  max: 1000,
-});
-
-const getLastUsageFromSessionTranscript = async (
-  sessionId: string
-): Promise<Usage | undefined> => {
-  const project = await searchProjectBySession(sessionId);
-  if (!project) return undefined;
-
-  const sessionFilePath = join(CLAUDE_PROJECTS_DIR, project, `${sessionId}.jsonl`);
-
-  try {
-    const fileStats = await stat(sessionFilePath);
-    const cached = sessionTranscriptUsageCache.get(sessionId);
-    if (cached && cached.mtimeMs === fileStats.mtimeMs) {
-      return cached.usage;
-    }
-
-    const handle = await open(sessionFilePath, "r");
-    try {
-      const size = fileStats.size;
-      const start = Math.max(0, size - SESSION_USAGE_TAIL_BYTES);
-      const length = size - start;
-      if (length <= 0) return undefined;
-
-      const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, start);
-
-      let text = buffer.toString("utf8");
-      if (start > 0) {
-        const firstNewline = text.indexOf("\n");
-        if (firstNewline >= 0) {
-          text = text.slice(firstNewline + 1);
-        }
-      }
-
-      const lines = text.split("\n");
-      for (let index = lines.length - 1; index >= 0; index--) {
-        const line = lines[index].trim();
-        if (!line) continue;
-        const usage = getUsageFromJsonlLine(line);
-        if (!usage) continue;
-
-        sessionTranscriptUsageCache.set(sessionId, {
-          mtimeMs: fileStats.mtimeMs,
-          usage,
-        });
-        return usage;
-      }
-
-      return undefined;
-    } finally {
-      await handle.close();
-    }
-  } catch {
-    return undefined;
-  }
-};
-
-const getEffectiveLastUsage = async (
-  req: any,
-  lastUsage?: Usage
-): Promise<{
-  usage?: Usage;
-  source: "cache" | "request" | "transcript" | "none";
-}> => {
-  if (usagePromptTokens(lastUsage) > 0) {
-    return { usage: lastUsage, source: "cache" };
-  }
-
-  const requestUsage = normalizeUsage(req?.body?.usage);
-  if (usagePromptTokens(requestUsage) > 0) {
-    return { usage: requestUsage, source: "request" };
-  }
-
-  if (!req?.sessionId) {
-    return { usage: lastUsage, source: "none" };
-  }
-
-  const transcriptUsage = await getLastUsageFromSessionTranscript(req.sessionId);
-  if (usagePromptTokens(transcriptUsage) > 0) {
-    return { usage: transcriptUsage, source: "transcript" };
-  }
-
-  return { usage: lastUsage, source: "none" };
-};
 
 export const calculateTokenCount = (
   messages: MessageParam[],
@@ -277,16 +137,28 @@ const extractMessageText = (
     .join("\n");
 };
 
-const hasTeamLeadTeammatePayload = (messages: MessageParam[] | undefined) => {
+const isTeamLeadRequest = (messages: MessageParam[] | undefined) => {
   if (!Array.isArray(messages)) return false;
+
+  let hasMessageToTeamLead = false;
+  let hasMessageToOtherTeammates = false;
+
   for (const message of messages) {
     if (message.role !== "user") continue;
     const text = extractMessageText(message.content);
-    if (text.includes('<teammate-message teammate_id="team-lead"')) {
-      return true;
+
+    if (/<teammate-message\s+teammate_id="team-lead"/.test(text)) {
+      hasMessageToTeamLead = true;
+    }
+
+    if (/<teammate-message\s+teammate_id="(?!team-lead")/.test(text)) {
+      hasMessageToOtherTeammates = true;
     }
   }
-  return false;
+
+  // Team-lead requests receive messages from teammates, but do not receive
+  // messages addressed to team-lead itself.
+  return hasMessageToOtherTeammates && !hasMessageToTeamLead;
 };
 
 interface ProviderConfig {
@@ -319,13 +191,12 @@ const isKnownProviderModel = (
 const getUseModel = async (
   req: any,
   tokenCount: number,
-  configService: ConfigService,
-  lastUsage?: Usage | undefined
+  configService: ConfigService
 ): Promise<{ model: string; scenarioType: RouterScenarioType }> => {
   const projectSpecificRouter = await getProjectSpecificRouter(req, configService);
   const providers = configService.get<ProviderConfig[]>("providers") || [];
   const Router = projectSpecificRouter || configService.get("Router");
-  const hasTeamLeadPayload = hasTeamLeadTeammatePayload(req.body?.messages);
+  const isTeamLead = isTeamLeadRequest(req.body?.messages);
 
   // Subagent model routing — HIGHEST priority, checked before comma-in-model.
   // Only scan system entries (NOT messages) to prevent routing leaks.
@@ -338,7 +209,7 @@ const getUseModel = async (
     );
     if (!match) continue;
 
-    entry.text = entry.text.replace(match[0], "");
+    entry.text = entry.text.replace(match[0], "").trim();
     const candidateModel = match[1].trim();
 
     if (
@@ -350,9 +221,9 @@ const getUseModel = async (
       continue;
     }
 
-    if (hasTeamLeadPayload) {
+    if (isTeamLead) {
       req.log.warn(
-        `Ignoring leaked subagent model tag due to team-lead payload: ${candidateModel}`
+        `Ignoring leaked subagent model tag in team-lead request: ${candidateModel}`
       );
       continue;
     }
@@ -364,6 +235,13 @@ const getUseModel = async (
 
     req.log.info(`Using subagent model: ${candidateModel}`);
     return { model: candidateModel, scenarioType: 'default' };
+  }
+
+  // Remove system entries emptied by tag stripping to restore the original request shape
+  if (Array.isArray(req.body.system)) {
+    req.body.system = req.body.system.filter(
+      (entry: any) => entry.type !== "text" || entry.text
+    );
   }
 
   const rawModel = req.body.model;
@@ -381,19 +259,12 @@ const getUseModel = async (
   }
 
   const longContextThreshold = Router?.longContextThreshold || 60000;
-  const { usage: effectiveLastUsage, source: usageSource } =
-    await getEffectiveLastUsage(req, lastUsage);
-  const effectiveLastUsagePromptTokens = usagePromptTokens(effectiveLastUsage);
-  const lastUsageThreshold =
-    effectiveLastUsagePromptTokens > longContextThreshold &&
-    tokenCount > MIN_TOKEN_COUNT_FOR_LAST_USAGE;
-  const tokenCountThreshold = tokenCount > longContextThreshold;
   req.log.info(
-    `LongContext decision metrics: tokenCount=${tokenCount}, usageSource=${usageSource}, lastUsage.input=${effectiveLastUsage?.input_tokens || 0}, lastUsage.cacheCreation=${effectiveLastUsage?.cache_creation_input_tokens || 0}, lastUsage.cacheRead=${effectiveLastUsage?.cache_read_input_tokens || 0}, lastUsagePromptTokens=${effectiveLastUsagePromptTokens}, minTokenCountForLastUsage=${MIN_TOKEN_COUNT_FOR_LAST_USAGE}, threshold=${longContextThreshold}`
+    `LongContext decision metrics: tokenCount=${tokenCount}, threshold=${longContextThreshold}`
   );
-  if ((lastUsageThreshold || tokenCountThreshold) && Router?.longContext) {
+  if (tokenCount > longContextThreshold && Router?.longContext) {
     req.log.info(
-      `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}, usageSource=${usageSource}`
+      `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}`
     );
     return { model: Router.longContext, scenarioType: 'longContext' };
   }
@@ -459,7 +330,6 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
       req.sessionId = parts[1];
     }
   }
-  const lastMessageUsage = sessionUsageCache.get(req.sessionId);
   const { messages, system = [], tools }: MessageCreateParamsBase = req.body;
   const rewritePrompt = configService.get("REWRITE_SYSTEM_PROMPT");
   if (
@@ -519,7 +389,7 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
       }
     }
     if (!model) {
-      const result = await getUseModel(req, tokenCount, configService, lastMessageUsage);
+      const result = await getUseModel(req, tokenCount, configService);
       model = result.model;
       req.scenarioType = result.scenarioType;
     } else {

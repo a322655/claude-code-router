@@ -229,6 +229,17 @@ const sanitizeEmptyThinkingSignatures = (
         return true;
       }
       const block = contentBlock as Record<string, unknown>;
+
+      // Remove empty text blocks with cache_control (API rejects these)
+      if (
+        block.type === "text" &&
+        !(block.text as string)?.trim() &&
+        block.cache_control
+      ) {
+        removedThinkingCount += 1;
+        return false;
+      }
+
       if (block.type !== "thinking") {
         return true;
       }
